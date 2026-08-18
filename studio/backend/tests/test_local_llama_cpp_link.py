@@ -126,6 +126,7 @@ def _run_orphan_scan(
     fake: _FakeProc,
     scan: str = "psutil",
     tmp_path: Path = None,
+    stub_orphaned: bool = True,
 ) -> int:
     # psutil drives the cross-platform process scan; skip (rather than error) if a
     # minimal test env lacks it. CI installs it so these tests actually run.
@@ -138,6 +139,27 @@ def _run_orphan_scan(
     )
     monkeypatch.setattr(LlamaCppBackend, "_reap_recorded_pid", staticmethod(lambda: 0))
 
+    if stub_orphaned:
+        # _FakeProc's pid is a number these tests made up, not a process they own,
+        # but the sweep asks the real OS whether that pid's parent is alive and
+        # spares the candidate when it is. Any unrelated process sitting on that
+        # pid therefore decided the assertions below -- which is how
+        # test_orphan_cleanup_kills_under_real_root[psutil] failed in CI with
+        # `assert 0 == 1` while proving nothing about the code under test. Declare
+        # the invented pid an orphan and leave every other pid to the real
+        # implementation, so these tests measure the ownership gate they exist for.
+        # The orphan gate itself keeps its own coverage in
+        # test_orphan_cleanup_spares_a_live_server_with_a_running_parent, which
+        # uses a process it really owns instead of an invented pid.
+        _real_parent_is_alive = LlamaCppBackend._pid_parent_is_alive
+        monkeypatch.setattr(
+            LlamaCppBackend,
+            "_pid_parent_is_alive",
+            staticmethod(
+                lambda pid: False if pid == fake.info["pid"] else _real_parent_is_alive(pid)
+            ),
+        )
+
     if scan == "procfs":
         # Linux reads /proc directly. Point it at a fixture tree and intercept the
         # signal, since the fixture's pid is not a real process.
@@ -145,11 +167,18 @@ def _run_orphan_scan(
             pytest.skip("the procfs scan only runs on Linux")
         monkeypatch.setattr(llama_cpp_module, "_PROC_ROOT", str(_fake_procfs(tmp_path, fake)))
 
+        _real_kill = os.kill
+
         def _fake_kill(pid, sig):
             if pid == fake.info["pid"]:
                 fake.kill()
                 return
-            raise ProcessLookupError(pid)
+            # Anything else is a real pid asked about by real code: psutil's
+            # pid_exists() is os.kill(pid, 0) on POSIX, and the orphan check runs
+            # through it. Swallowing those made this branch silently report every
+            # parent as dead, so the procfs case passed for a reason that had
+            # nothing to do with what it claims to test.
+            return _real_kill(pid, sig)
 
         monkeypatch.setattr(os, "kill", _fake_kill)
     else:
@@ -189,3 +218,38 @@ def test_orphan_cleanup_kills_under_real_root(tmp_path: Path, monkeypatch, scan)
     killed = _run_orphan_scan(monkeypatch, studio_root, fake, scan, tmp_path)
     assert killed == 1
     assert fake.killed is True
+
+
+@pytest.mark.parametrize("scan", ["psutil", "procfs"])
+def test_orphan_cleanup_spares_a_live_server_with_a_running_parent(
+    tmp_path: Path, monkeypatch, scan
+) -> None:
+    # The other direction of the orphan gate, and the reason the tests above may
+    # stub it: a server under a managed root whose parent is still running belongs
+    # to a live Unsloth (or the user's shell) and must survive the sweep. Driven by
+    # a child process this test really owns -- its parent is this pytest process,
+    # so "the parent is alive" is a fact here rather than a guess about a pid
+    # nobody controls.
+    studio_root = tmp_path / "studio-home"
+    bin_dir = studio_root / "llama.cpp" / _server_subpath().parent
+    bin_dir.mkdir(parents = True)
+    exe = studio_root / "llama.cpp" / _server_subpath()
+    exe.write_text("x")
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        fake = _FakeProc(child.pid, str(exe.resolve()))
+        killed = _run_orphan_scan(
+            monkeypatch, studio_root, fake, scan, tmp_path, stub_orphaned = False
+        )
+        # The binary is owned and the name matches, so only the live parent can be
+        # what spared it.
+        assert killed == 0
+        assert fake.killed is False
+    finally:
+        # The procfs scan patches os.kill and this child's pid is the one that
+        # patch intercepts, so undo it first or Popen.kill() is swallowed and the
+        # wait below blocks for the child's full sleep.
+        monkeypatch.undo()
+        child.kill()
+        child.wait()
